@@ -1,0 +1,318 @@
+--- orig/main.go	2026-10-19 18:28:18.529737131 +0000
++++ new/main.go	2026-10-19 18:28:18.767926019 +0000
+@@ -2,8 +2,10 @@
+ 
+ import (
+ 	"bytes"
++	"errors"
+ 	"flag"
+ 	"fmt"
++	"math"
+ 	"os"
+ 	"regexp"
+ 	"strconv"
+@@ -28,6 +30,7 @@
+ 	providedElectrum     string
+ 	usesProvidedElectrum bool
+ 	onlyScan             bool
++	minFeeRate           float64
+ }
+ 
+ func main() {
+@@ -39,12 +42,12 @@
+ 	flag.BoolVar(&config.generateContacts, "generate-contacts", false, "Generate contact addresses")
+ 	flag.StringVar(&config.providedElectrum, "electrum-server", "", "Connect to this electrum server to find funds")
+ 	flag.BoolVar(&config.onlyScan, "only-scan", false, "Only scan for UTXOs without generating a transaction")
++	flag.Float64Var(&config.minFeeRate, "min-fee-rate", 0.5, "Minimum accepted fee rate in sats/byte (the original tool enforced 1)")
+ 	flag.Usage = printUsage
+ 	flag.Parse()
+ 	args := flag.Args()
+ 
+-	// Ensure correct form:
+-	if len(args) > 1 {
++	if config.minFeeRate <= 0 {
+ 		printUsage()
+ 		os.Exit(0)
+ 	}
+@@ -57,40 +60,77 @@
+ 		validateProvidedElectrum(config.providedElectrum)
+ 	}
+ 
+-	// We're going to need a few things to move forward with the recovery process. Let's make a list
+-	// so we keep them in mind:
+-	var recoveryCode string
+-	var encryptedKeys []*libwallet.EncryptedPrivateKeyInfo
++	// The destination address is shared by all accounts, so we ask for it only once:
+ 	var destinationAddress btcutil.Address
++	if !config.onlyScan {
++		destinationAddress = readAddress()
++	}
++
++	// Each argument is an Emergency Kit PDF (one account each). Without arguments we fall back to
++	// the original flow, with manual input of the encrypted keys (a single account).
++	kits := args
++	if len(kits) == 0 {
++		kits = []string{""}
++	}
++
++	failed := 0
++
++	for i, kit := range kits {
++		sayBlock("{blue ═══ Account %d of %d %s ═══}\n", i+1, len(kits), kit)
++
++		err := recoverAccount(kit, destinationAddress, config)
++
++		if errors.Is(err, errCancelled) {
++			sayBlock("Account skipped.\n")
++		} else if err != nil {
++			failed++
++			printAccountError(err)
++		}
++	}
+ 
+-	// First on our list is the Recovery Code. This is the time to go looking for that piece of paper:
+-	recoveryCode = readRecoveryCode()
++	if failed > 0 {
++		_ = os.WriteFile("error_log", debugOutputStream.Bytes(), 0600)
++		os.Exit(1)
++	}
+ 
+-	// Good! Now, on to those keys. We need to read them and decrypt them:
+-	encryptedKeys, err := readBackupFromInputOrPDF(flag.Arg(0))
++	sayBlock("We appreciate all kinds of feedback. If you have any, send it to {blue contact@muun.com}\n")
++}
++
++// recoverAccount runs the whole flow (recovery code, keys, scan and sweep) for a single account.
++// Errors are returned instead of exiting, so a failure doesn't abort the rest of the batch.
++func recoverAccount(pdf string, destinationAddress btcutil.Address, config config) error {
++	recoveryCode := readRecoveryCode()
++
++	encryptedKeys, err := readBackupFromInputOrPDF(pdf)
+ 	if err != nil {
+-		exitWithError(err)
++		return err
+ 	}
+ 
+ 	decryptedKeys, err := decryptKeys(encryptedKeys, recoveryCode)
+ 	if err != nil {
+-		exitWithError(err)
++		return err
+ 	}
+ 
+ 	decryptedKeys[0].Key.Path = "m/1'/1'" // a little adjustment for legacy users.
+ 
+-	if !config.onlyScan {
+-		// Finally, we need the destination address to sweep the funds:
+-		destinationAddress = readAddress()
+-	}
+-
+ 	sayBlock(`
+ 		Starting scan of all possible addresses. This will take a few minutes.
+ 	`)
+ 
+-	doRecovery(decryptedKeys, destinationAddress, config)
++	return doRecovery(decryptedKeys, destinationAddress, config)
++}
+ 
+-	sayBlock("We appreciate all kinds of feedback. If you have any, send it to {blue contact@muun.com}\n")
++func printAccountError(err error) {
++	sayBlock(`
++		{red Error!}
++		The Recovery Tool couldn't process this account. Continuing with the next one, if any.
++
++		――― {white error report} ―――
++		%v
++		――――――――――――――――――――
++	`, err)
++
++	_ = utils.NewLogger("").Errorf("account failed with error: %s", err.Error())
+ }
+ 
+ // doRecovery runs the scan & sweep process, and returns the ID of the broadcasted transaction.
+@@ -98,7 +138,7 @@
+ 	decryptedKeys []*libwallet.DecryptedPrivateKey,
+ 	destinationAddress btcutil.Address,
+ 	config config,
+-) {
++) error {
+ 
+ 	addrGen := NewAddressGenerator(decryptedKeys[0].Key, decryptedKeys[1].Key, config.generateContacts)
+ 
+@@ -137,7 +177,7 @@
+ 	fmt.Println()
+ 
+ 	if lastReport.Err != nil {
+-		exitWithError(fmt.Errorf("error while scanning addresses: %w", lastReport.Err))
++		return fmt.Errorf("error while scanning addresses: %w", lastReport.Err)
+ 	}
+ 
+ 	say("{green ✓ Scan complete}\n")
+@@ -145,7 +185,7 @@
+ 
+ 	if len(utxos) == 0 {
+ 		sayBlock("No funds were discovered\n\n")
+-		return
++		return nil
+ 	}
+ 
+ 	var total int64
+@@ -156,27 +196,27 @@
+ 
+ 	say("\n— {white %d} sats total\n", total)
+ 	if config.onlyScan {
+-		return
++		return nil
+ 	}
+ 
+ 	txOutputAmount, txWeightInBytes, err := sweeper.GetSweepTxAmountAndWeightInBytes(utxos)
+ 	if err != nil {
+-		exitWithError(err)
++		return err
+ 	}
+ 
+-	fee := readFee(txOutputAmount, txWeightInBytes)
++	fee := readFee(txOutputAmount, txWeightInBytes, config.minFeeRate)
+ 
+ 	// Then we re-build the sweep tx with the actual fee
+ 	sweepTx, err := sweeper.BuildSweepTx(utxos, fee)
+ 	if err != nil {
+-		exitWithError(err)
++		return err
+ 	}
+ 
+ 	sayBlock("Sending transaction...")
+ 
+ 	err = sweeper.BroadcastTx(sweepTx)
+ 	if err != nil {
+-		exitWithError(err)
++		return err
+ 	}
+ 
+ 	sayBlock(`
+@@ -184,6 +224,8 @@
+ 		(it will appear in mempool.space after a short delay)
+ 
+ 	`, sweepTx.TxHash().String())
++
++	return nil
+ }
+ 
+ func validateProvidedElectrum(providedElectrum string) {
+@@ -248,7 +290,7 @@
+ }
+ 
+ func printUsage() {
+-	fmt.Println("Usage: recovery-tool [optional: path to Emergency Kit PDF]")
++	fmt.Println("Usage: recovery-tool [optional: paths to one or more Emergency Kit PDFs]")
+ 	flag.PrintDefaults()
+ }
+ 
+@@ -409,26 +451,26 @@
+ 	return addr
+ }
+ 
+-func readFee(totalBalance, weight int64) int64 {
++func readFee(totalBalance, weight int64, minFeeRate float64) int64 {
+ 	sayBlock(`
+ 		{yellow Enter the fee rate (sats/byte)}
+-		Your transaction weighs %v bytes. You can get suggestions in https://mempool.space/ under "Transaction fees".
+-	`, weight)
++		Your transaction weighs %v bytes. Minimum accepted: %v sats/byte (decimals allowed). You can get suggestions in https://mempool.space/ under "Transaction fees".
++	`, weight, minFeeRate)
+ 
+ 	var userInput string
+ 	ask(&userInput)
+ 
+-	feeInSatsPerByte, err := strconv.ParseInt(userInput, 10, 64)
+-	if err != nil || feeInSatsPerByte <= 0 {
++	feeRate, err := strconv.ParseFloat(userInput, 64)
++	if err != nil || math.IsNaN(feeRate) || math.IsInf(feeRate, 0) || feeRate < minFeeRate {
+ 		say(`
+-			The fee must be a whole number
++			The fee rate must be a number, and at least %v sats/byte
+ 			Please, try again
+-		`)
++		`, minFeeRate)
+ 
+-		return readFee(totalBalance, weight)
++		return readFee(totalBalance, weight, minFeeRate)
+ 	}
+ 
+-	totalFee := feeInSatsPerByte * weight
++	totalFee := int64(math.Ceil(feeRate * float64(weight)))
+ 
+ 	if totalBalance-totalFee < 546 {
+ 		say(`
+@@ -436,13 +478,14 @@
+ 			Please, try again
+ 		`)
+ 
+-		return readFee(totalBalance, weight)
++		return readFee(totalBalance, weight, minFeeRate)
+ 	}
+ 
+ 	return totalFee
+ }
+ 
+-func readConfirmation(value, fee int64, address string) {
++// readConfirmation asks the user to confirm the sweep. Returns false if the user declines.
++func readConfirmation(value, fee int64, address string) bool {
+ 	sayBlock(`
+ 		{whiteUnderline Summary}
+ 		  {white Amount}: %v sats
+@@ -456,21 +499,17 @@
+ 	ask(&userInput)
+ 
+ 	if userInput == "y" || userInput == "Y" {
+-		return
++		return true
+ 	}
+ 
+ 	if userInput == "n" || userInput == "N" {
+-		sayBlock(`
+-			Recovery tool stopped
+-			You can try again or contact us at {blue support@muun.com}
+-		`)
+-		os.Exit(1)
++		return false
+ 	}
+ 
+ 	say(`You can only enter 'y' to confirm or 'n' to cancel`)
+ 
+ 	fmt.Print("\n\n")
+-	readConfirmation(value, fee, address)
++	return readConfirmation(value, fee, address)
+ }
+ 
+ var leadingIndentRe = regexp.MustCompile("^[ \t]+")
+--- orig/recovery_tool.go	2026-10-19 18:28:18.665737125 +0000
++++ new/recovery_tool.go	2026-10-19 18:28:18.768122558 +0000
+@@ -3,6 +3,7 @@
+ import (
+ 	"bytes"
+ 	"encoding/hex"
++	"errors"
+ 
+ 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+ 	"github.com/btcsuite/btcd/wire"
+@@ -13,6 +14,9 @@
+ 	"github.com/muun/recovery/scanner"
+ )
+ 
++// errCancelled is returned when the user declines the sweep confirmation.
++var errCancelled = errors.New("sweep cancelled by user")
++
+ func buildSweepTx(utxos []*scanner.Utxo, sweepAddress btcutil.Address, fee int64) ([]byte, error) {
+ 
+ 	tx := wire.NewMsgTx(2)
+@@ -48,7 +52,9 @@
+ 	}
+ 
+ 	if fee != 0 {
+-		readConfirmation(value, fee, sweepAddress.String())
++		if !readConfirmation(value, fee, sweepAddress.String()) {
++			return nil, errCancelled
++		}
+ 	}
+ 
+ 	return writer.Bytes(), nil

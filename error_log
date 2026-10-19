@@ -1,0 +1,3 @@
+ERROR: 2026-10-19T16:55:26.9532846-04:00 [] account failed with error: cuenta 1: no se encontró 1.pdf en la carpeta
+ERROR: 2026-10-19T16:55:26.9722605-04:00 [] account failed with error: cuenta 2: no se encontró 2.pdf en la carpeta
+ERROR: 2026-10-19T16:55:26.9741036-04:00 [] exited with error: no se pudo preparar ninguna cuenta
